@@ -10,12 +10,16 @@ def main():
                     prog='petra2density',
                     description='Converts a bias-field-corrected PETRA image to a density map. Requires a CHARM segmentation.')
     parser.add_argument('m2m_folder', help="path to the m2m_folder created by CHARM")
+    parser.add_argument('--register_to_petra', action='store_true', default=False)
     args = parser.parse_args()
     m2m_folder = Path(args.m2m_folder)
 
     label_image = nib.load(m2m_folder / "final_tissues.nii.gz")
     label = label_image.get_fdata().squeeze()
-    petra_image = nib.load(m2m_folder / "T2_reg.nii.gz")
+    if args.register_to_petra:
+        petra_image = nib.load(m2m_folder / "T1.nii.gz")
+    else:
+        petra_image = nib.load(m2m_folder / "T2_reg.nii.gz")
     petra_data = petra_image.get_fdata()
     
     background = label == 0

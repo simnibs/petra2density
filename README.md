@@ -16,10 +16,12 @@ See [the simnibs docs](https://github.com/simnibs/simnibs) for installation inst
 Activate the simnibs conda environment.
 
 ```
-./petra2density SUBJECT_ID /path/to/T1.nii.gz /path/to/PETRA.nii.gz
+./petra2density.sh [-p] SUBJECT_ID /path/to/T1.nii.gz /path/to/PETRA.nii.gz
 ```
 
 Creates ``m2m_SUBJECT_ID`` in the current directory with ``density.nii.gz``.
+
+Use ``-p`` to register to the PETRA image. Default is to register to the T1 image.
 
 # References
 
