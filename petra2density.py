@@ -16,7 +16,10 @@ def main():
     parser.add_argument('--ct2density_calibration_file', default=None, help="A CSV with points defining a mapping from HU to density. The file should contain two columns. First column should be HU values, second column should be density values.")
     args = parser.parse_args()
     
-    ct2density_calibration_points = np.loadtxt(args.ct2density_calibration_file) if args.ct2density_calibration_file is not None else None    
+    if args.ct2density_calibration_file is not None and args.ct2density_calibration_file != "none":
+        ct2density_calibration_points = np.loadtxt(args.ct2density_calibration_file)
+    else:
+        ct2density_calibration_points = None
     
     m2m_folder = Path(args.m2m_folder)
 
