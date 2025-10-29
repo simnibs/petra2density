@@ -15,13 +15,22 @@ See [the simnibs docs](https://github.com/simnibs/simnibs) for installation inst
 
 Activate the simnibs conda environment.
 
+
 ```
-./petra2density.sh [-p] SUBJECT_ID /path/to/T1.nii.gz /path/to/PETRA.nii.gz
+python petra2density.py SUBJECT_ID /path/to/T1.nii.gz /path/to/PETRA.nii.gz /path/to/output_folder [--register_to_petra] [--ct2density_calibration_file /path/to/calibration_file.csv] [--kplan]
 ```
 
-Creates ``m2m_SUBJECT_ID`` in the current directory with ``density.nii.gz``.
 
-Use ``-p`` to register to the PETRA image. Default is to register to the T1 image.
+Output_folder should already exist. Creates ``output_folder/SUBJECT_ID/m2m_SUBJECT_ID``.
+
+
+The density image is here: ``output_folder/SUBJECT_ID/m2m_SUBJECT_IDdensity.nii.gz``.
+
+
+Use ``--register_to_petra`` to register to the PETRA image. Default is to register to the T1 image.
+
+
+Use ``--kplan`` to align the image to a space compatible with kplan.
 
 # References
 
