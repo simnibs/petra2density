@@ -1,20 +1,41 @@
-from numpy import histogram, argmax, ones, logical_not, polyval
-import nibabel as nib
-from nibabel.orientations import aff2axcodes
-import matplotlib.pyplot as plt
+# stdlib
+import csv
 from pathlib import Path
 import argparse
 import os.path
-import numpy as np
 import sys
-import subprocess
+
+# external
+from numpy import histogram, argmax, ones, logical_not, polyval
+import numpy as np
+import nibabel as nib
+from nibabel.orientations import aff2axcodes
+import matplotlib.pyplot as plt
+
+# simnibs
+from simnibs import __version__ as simnibs_version
+from samseg import gems
+from simnibs.segmentation import charm_main
+import simnibs.cli.charm
+
 
 np.set_printoptions(suppress=True, linewidth=120, precision=6)
+
+MAX_CT_VALUE = 3150 # [hu]
+MAX_DENSITY_VALUE = 3147.35469785 # [kg/m3]
+DENSITY_WATER = 1000  # [kg/m3]
+DENSITY_AIR = 1.275 # [kg/m3]
 
 def cli():
     parser = argparse.ArgumentParser(
                     prog='petra2density',
-                    description='Runs a head and brain segmentation with CHARM and converts a bias-field-corrected PETRA image to a density map.')
+                    description=(
+                        'Takes a T1w and PETRA MRI as input and creates a density map.\n'
+                        '\n'
+                        'petra2density uses CHARM from SimNIBS to segment and bias-field correct the input images.'
+                        '\n'
+                        'petra2density accepts arguments for the charm segmentation tool (e.g. --noneck and --forcesform). See charm documentation for details.'
+                        ))
 
     parser.add_argument('subject_id', help="results will be placed in output_folder/subject_id")
     parser.add_argument('t1_path', help="path to the T1w input image. should be .nii or .nii.gz")
@@ -23,12 +44,7 @@ def cli():
                         help="Folder to store the results. output_folder should already exist. The folder output_folder/subject_id will be created.")
 
     parser.add_argument('--register_to_petra', action='store_true', default=False,
-                        help="Swaps the input arguments to CHARM so that T1 images is registered to PETRA")
-
-    parser.add_argument('--ct2density_calibration_file', default=None,
-                        help=("A CSV with points defining a mapping from HU to density. "
-                              "The file should contain two columns. "
-                              "First column should be HU values, second column should be density values."))
+                        help="Registers the T1 image to PETRA before running the rest of the pipeline. This is a good idea when your PETRA image is higher resolution than your T1 image.")
 
     parser.add_argument('--kplan', action='store_true', default=False,
                         help="Align images to a space compatible with k-Plan (RAS+, origin at LPI).")
@@ -36,73 +52,213 @@ def cli():
     parser.add_argument('--charm_done', action='store_true', default=False,
                         help="use this if charm is already done with the configuration you want to use. if using --charm_done, output_folder/subject_id/m2m_subject_id should already exist.")
 
-    args = parser.parse_args()
+    parser.add_argument('--ct_to_density_calibration',
+            default="ct_to_density_calibration_cph2025_v1.csv",
+            choices=[
+                "ct_to_density_calibration_cph2025_v1.csv",
+                "ct-calibration-low-dose-30-March-2023-v1.csv", # https://github.com/ucl-bug/petra-to-ct/
+                ],
+            help=("Select the calibration to convert CT to density.\n"
+                  "A CSV with points defining a mapping from HU to density. \n"
+                  "The file should contain two columns. \n"
+                  "First column should be HU values, second column should be density values."))
 
+    parser.add_argument('--norm_petra_to_pct_parameters',
+            default="norm_petra_to_pct_parameters_cph2025_v1.csv",
+            choices=[
+                "norm_petra_to_pct_parameters_cph2025_v1.csv",
+                "norm_petra_to_pct_ucl.csv", # https://github.com/ucl-bug/petra-to-ct/
+                ],
+            help="Select the parameters to convert a normalized petra to pseudo-CT.")
+
+    args, remaining_args = parser.parse_known_args()
+    remaining_args.extend([args.subject_id, args.t1_path]) # the t1_path here is not used. it's just here so i can reuse the parseArgument function from charm. the t1_path may be over-written elsewhere in this program
+    charm_args = simnibs.cli.charm.parseArguments(remaining_args)
+    main(args, charm_args)
+
+
+def simnibs_version_4_6_or_later():
+    v_major, v_minor, _ = [int(v) for v in simnibs_version.split(".")]
+    return v_major > 4 or (v_major == 4 and v_minor >= 6)
+
+
+def charm_settings_file_name():
+    return "charm_simnibs_v4-6.ini" if simnibs_version_4_6_or_later() else "charm_simnibs_v4-5.ini"
+
+
+def main(args, charm_args):
     t1_path = Path(args.t1_path).resolve()
     petra_path = Path(args.petra_path).resolve()
     subject_folder = Path(args.output_folder).resolve() / args.subject_id
     m2m_folder = subject_folder / f"m2m_{args.subject_id}"
-    charm_settings = Path().resolve() / "charm.ini"
-    petra_is_called_t1_in_m2m_folder = args.register_to_petra
+    ct_to_density_calibration_path = Path(__file__).parent.resolve() / "maps" / args.ct_to_density_calibration
+    norm_petra_to_pct_parameters_path = Path(__file__).parent.resolve() / "maps" / args.norm_petra_to_pct_parameters
+    charm_settings = Path(__file__).parent.resolve() / "config" / charm_settings_file_name()
+
+    # read the calibration files. fails here if they are not found
+    norm_petra_to_pct_parameters = read_norm_petra_to_pct_parameter_file(norm_petra_to_pct_parameters_path)
+    ct_to_density_calibration = read_ct_to_density_calibration_file(ct_to_density_calibration_path)
 
     if args.charm_done and not m2m_folder.is_dir():
         print(f"m2m_folder is {m2m_folder}")
-        print("error. when using --charm_done, output_folder/subject_id/m2m_subject_id should already exist. this is the . It does not. Exiting")
+        print("error. when using --charm_done, the output_folder/subject_id/m2m_subject_id should already exist. It does not. Exiting")
         sys.exit(1)
 
     if not args.charm_done:
         os.mkdir(subject_folder)
+        os.mkdir(m2m_folder)
 
     if args.kplan:
         if args.register_to_petra:
             petra_path = align_image_to_kplan_space(petra_path, subject_folder)
         else:
             t1_path = align_image_to_kplan_space(t1_path, subject_folder)
+        
+    if args.register_to_petra:
+        t1_path = register_t1_to_petra(args.subject_id, t1_path, petra_path, subject_folder)
 
     if not args.charm_done:
-        run_segmentation(args.subject_id, t1_path, petra_path, subject_folder, register_to_petra=args.register_to_petra, use_settings=charm_settings)
-    convert_petra_to_density(m2m_folder, args.ct2density_calibration_file, petra_is_called_t1_in_m2m_folder)
+        if not simnibs_version_4_6_or_later():
+            t1_path = add_small_value_to_image(t1_path, subject_folder)
+            petra_path = add_small_value_to_image(petra_path, subject_folder)
+        run_segmentation(args.subject_id, t1_path, petra_path, m2m_folder, register_to_petra=args.register_to_petra, use_settings=charm_settings, charm_args=charm_args)
+
+    convert_petra_to_density(m2m_folder, norm_petra_to_pct_parameters, ct_to_density_calibration)
 
 
-def run_segmentation(subject_id, t1_path, petra_path, output_folder, register_to_petra=False, use_settings=None):
-    first_image, second_image = t1_path, petra_path
-    if register_to_petra:
-        first_image, second_image = petra_path, t1_path
+def read_norm_petra_to_pct_parameter_file(path):
+    """
+    reads the csv file that has the parameters to convert a
+    normalized petra to a pseudo-ct
 
-    subprocess.run(["charm", subject_id, first_image, second_image, "--usesettings", use_settings, "--forceqform"], cwd=output_folder) 
+    fails if any parameters are missing and prints out the missing parameters
+    """
+    params = dict(
+            background = None,
+            soft_tissue = None,
+            bone_offset = None,
+            bone_slope = None,
+            )
+
+    with open(path) as f:
+        reader = csv.reader(f, delimiter=',')
+        for row in reader:
+            if row[0].strip().startswith('#'):
+                continue
+            params[row[0].strip()] = float(row[1])
+
+    assert not any(v is None for k, v in params.items()), f"must fill all norm_petra_to_pct parameters. missing parameters: {[k for k, v in params.items() if v is None]}"
+    return params
 
 
-def convert_petra_to_density(m2m_folder, ct2density_calibration_file=None, petra_is_called_t1=False):
-    if ct2density_calibration_file is not None and ct2density_calibration_file != "none":
-        print("Using ct->density calibration file: {ct2density_calibration_file}")
-        ct2density_calibration_points = np.loadtxt(ct2density_calibration_file)
-    else:
-        ct2density_calibration_points = None
-    
-    label_image = nib.load(m2m_folder / "final_tissues.nii.gz")
-    label = label_image.get_fdata().squeeze()
-    if petra_is_called_t1:
-        petra_image = nib.load(m2m_folder / "T1.nii.gz")
-    else:
-        petra_image = nib.load(m2m_folder / "T2_reg.nii.gz")
-    petra_data = petra_image.get_fdata()
-    
+def read_ct_to_density_calibration_file(path):
+    """
+    reads the csv file with the ct to density calibration.
+
+    add a final point with MAX_CT_VALUE and MAX_DENSITY_VALUE. This is to ensure that the maximum threshold is not too low.
+    """
+    points = np.loadtxt(path, delimiter=",")
+    points = np.concatenate((points, [[MAX_CT_VALUE, MAX_DENSITY_VALUE]]))
+    hu_values, density_values = points[:, 0], points[:, 1]
+    assert np.all(np.diff(hu_values) > 0), "ct to density values must be increasing only in the calibration file."
+    assert np.all(np.diff(density_values) > 0), "ct to density values must be increasing only in the calibration file."
+    return points
+
+
+def register_t1_to_petra(subject_id, t1_path, petra_path, output_folder : Path):
+    """
+    Rigid registration of t1 to petra using charm
+    output file is saved as output_folder / t1_reg2petra.nii.gz
+    """
+    RAS2LPS = np.diag([-1, -1, 1, 1])
+    reg = gems.KvlRigidRegistration()
+    reg.read_images(str(petra_path), str(t1_path))
+    reg.initialize_transform()
+    reg.register()
+    trans_mat = RAS2LPS@reg.get_transformation_matrix()@RAS2LPS
+    t1_output_path = output_folder / "t1_reg2petra.nii.gz"
+    reg.write_out_result(str(t1_output_path))
+    mat_path = output_folder / 't1_reg2petra_dof6.dat'
+    np.savetxt(str(mat_path), trans_mat)
+    return t1_output_path
+
+
+def add_small_value_to_image(image_path, output_folder, small_value=0.01):
+    """
+    adds a small value to an image and saves it.
+
+    this is sometimes needed for segmenting images with simnibs versions older than 4.6
+    """
+    image = nib.load(image_path)
+    image_data = image.get_fdata()
+    min_value = image_data.min()
+    if min_value <= 0:
+        min_value -= small_value
+        print(f"adding {abs(min_value)} to {image_path.name} to ensure all values are positive")
+        new_image = nib.Nifti1Pair(image_data + abs(min_value), image.affine, image.header)
+        name = image_path.name.replace(".nii", "_positive.nii")
+        output_path = output_folder / name
+        nib.save(new_image, output_path)
+        return output_path
+    return image_path
+
+
+def run_segmentation(subject_id, t1_path, petra_path, m2m_folder, register_to_petra, use_settings, charm_args):
+    """
+    charm
+
+    """
+    charm_main.run(
+        str(m2m_folder),
+        T1 = str(t1_path),
+        T2 = str(petra_path),
+        registerT2 = not register_to_petra, # if the t1 has already been registered to the petra then there is no need to register again
+        usesettings=str(use_settings),
+        initatlas = True,
+        segment = True,
+
+        mesh_image = True, # todo: this is on by default for now but not needed for this program
+        create_surfaces = True, # todo: this is on by default for now but not needed for this program
+        #create_surfaces = charm_args.surfaces,
+        #mesh_image = charm_args.mesh,
+
+        noneck = charm_args.noneck,
+        init_transform = charm_args.inittransform,
+        use_transform = charm_args.usetransform,
+        force_qform = charm_args.forceqform,
+        force_sform = charm_args.forcesform,
+        fs_dir = charm_args.fs_dir,
+        options_str = " ".join(sys.argv[1:]),
+        debug = charm_args.debug,
+    )
+
+
+def bone_from_label(label):
+    """
+    get bone label from the m2m_subid/final_tissues.nii.gz label
+    """
+    return (label == 7) | (label == 8)
+
+
+def soft_tissue_from_label(label):
+    """
+    get soft tissue label from the m2m_subid/final_tissues.nii.gz label
+    soft tissue is defined as everything that is not air or bone in the image
+    """
     background = label == 0
-    bone = (label == 7) | (label == 8)
+    bone = bone_from_label(label)
     soft_tissue = logical_not(background) & logical_not(bone)
-    
-    pct = petra_to_pct(bone, soft_tissue, petra_data)
-    density = pct_to_density(bone, soft_tissue, pct, ct2density_calibration_points)
-    
-    density_image = nib.Nifti1Pair(density, petra_image.affine)
-    output_path = m2m_folder / "density.nii.gz"
-    nib.save(density_image, output_path)
-    print(f"Done. Density image is here: {output_path}")
-    
+    return soft_tissue
 
-def petra_to_pct(bone_label, soft_tissue_label, petra_data, plot=False):
+
+def normalize_petra(petra_data, label, plot=False):
+    """
+    normalize a petra image to the peak soft-tissue value in the histogram.
+
+    """
     petra = petra_data.squeeze()
-    h = histogram(petra[soft_tissue_label], bins=100)
+    soft_tissue = soft_tissue_from_label(label)
+    h = histogram(petra[soft_tissue], bins=100)
     bins = (h[1][1:] + h[1][:-1])/2
     vals = h[0]
     soft_tissue_value = bins[argmax(vals)]
@@ -112,35 +268,51 @@ def petra_to_pct(bone_label, soft_tissue_label, petra_data, plot=False):
         plt.scatter(soft_tissue_value, max(vals))
         plt.show()
     norm_petra = petra_data / soft_tissue_value
-    pct = -1000 * ones(norm_petra.shape)
-    pct[soft_tissue_label] = 42
-    pct[bone_label] = -2929.6 * norm_petra[bone_label] + 3274
+    return norm_petra
+
+
+def convert_petra_to_density(m2m_folder, norm_petra_to_pct_parameters, ct_to_density_calibration):
+    label_image = nib.load(m2m_folder / "final_tissues.nii.gz")
+    label = label_image.get_fdata().squeeze()
+    petra_image = nib.load(m2m_folder / "segmentation" / "T2_bias_corrected.nii.gz")
+    petra = petra_image.get_fdata()
+    
+    # save the petra with the name petra
+    nib.save(petra_image, m2m_folder / "p2d_petra_bfc.nii.gz")
+    
+    # create and save normalized petra
+    norm_petra = normalize_petra(petra, label)
+    nib.save(nib.Nifti1Pair(norm_petra, petra_image.affine), m2m_folder / "p2d_norm_petra.nii.gz")
+
+    # create and save pseudo-ct
+    pct = petra_to_pct(norm_petra, label, norm_petra_to_pct_parameters)
+    nib.save(nib.Nifti1Pair(pct, petra_image.affine), m2m_folder / "p2d_pct.nii.gz")
+
+    # create and save density
+    density = pct_to_density(pct, label, ct_to_density_calibration)
+    output_path = m2m_folder / "p2d_density.nii.gz"
+    nib.save(nib.Nifti1Pair(density, petra_image.affine), output_path)
+    print(f"Done. Density image is here: {output_path}")
+    
+
+def petra_to_pct(norm_petra, label, norm_petra_to_pct_parameters):
+    params = norm_petra_to_pct_parameters
+    soft_tissue = soft_tissue_from_label(label)
+    bone = bone_from_label(label)
+    pct = ones(norm_petra.shape) * params["background"]
+    pct[soft_tissue] = params["soft_tissue"]
+    pct[bone] = params["bone_slope"] * norm_petra[bone] + params["bone_offset"]
     return pct
 
 
-def pct_to_density(bone_label, soft_tissue_label, ct, ct2density_calibration_points=None):
-    rho_water = 1000  # density [kg/m3]
-    rho_air = 1.275
-    HU_water = 0
-    HU_air = -1000
-    if ct2density_calibration_points is not None:
-        hu_values, density_values = ct2density_calibration_points[:, 0], ct2density_calibration_points[:, 1]
-        assert np.all(np.diff(density_values) > 0), "Density values must be increasing only."
-        density = np.interp(ct[:], hu_values, density_values)
-        density = density.reshape(ct.shape)
-        density[(density < rho_water) & bone_label] = rho_water # to avoid having values less than water
-        density[density < rho_air] = rho_air # no density values should be less than air
-        return density
-    else:
-        p = [0.455927942656135, 1.003775211687315e+03]
-
-        density = rho_air * ones(ct.shape)
-        density[soft_tissue_label] = rho_water
-        density[bone_label] = polyval(p, ct[bone_label]) # HU-rho mapping (HU>0)
-        density[(ct < 0) & bone_label] = rho_air + (ct[(ct < 0) & bone_label] - HU_air) * (rho_water-rho_air)/(HU_water-HU_air)  # HU-rho mapping (-1000<HU<0)
-        density[(density < rho_water) & bone_label] = rho_water # to avoid having values less than water
-        density[density < rho_air] = rho_air # no density values should be less than air
-        return density
+def pct_to_density(pct, label, ct_to_density_calibration):
+    hu_values, density_values = ct_to_density_calibration[:, 0], ct_to_density_calibration[:, 1]
+    density = np.interp(pct[:], hu_values, density_values)
+    density = density.reshape(pct.shape)
+    bone = bone_from_label(label)
+    density[(density < DENSITY_WATER) & bone] = DENSITY_WATER # bone should not have lower density than water
+    density[density < DENSITY_AIR] = DENSITY_AIR # nothing should have lower density than air
+    return density
  
  
 def describe(img, title=""):
