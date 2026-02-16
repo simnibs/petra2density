@@ -1,6 +1,8 @@
 data/
 deps/
 temp/
+config_test/
+notebooks/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
