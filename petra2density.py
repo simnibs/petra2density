@@ -292,6 +292,12 @@ def convert_petra_to_density(m2m_folder, norm_petra_to_pct_parameters, ct_to_den
     bone_mask = bone_from_label(label).astype(np.int16)
     nib.save(nib.Nifti1Pair(bone_mask, petra_image.affine, petra_image.header), m2m_folder / "p2d_bone_mask.nii.gz")
 
+    # create and save soft-tissue/bone mask
+    soft_tissue_bone_mask = np.zeros(bone_mask.shape, dtype=np.int16)
+    soft_tissue_bone_mask[soft_tissue_from_label(label)] = 1
+    soft_tissue_bone_mask[bone_from_label(label)] = 2
+    nib.save(nib.Nifti1Pair(soft_tissue_bone_mask, petra_image.affine, petra_image.header), m2m_folder / "p2d_soft_tissue_bone_label.nii.gz")
+
     # create and save pseudo-ct
     pct = petra_to_pct(norm_petra, label, norm_petra_to_pct_parameters)
     nib.save(nib.Nifti1Pair(pct, petra_image.affine, petra_image.header), m2m_folder / "p2d_pct.nii.gz")
