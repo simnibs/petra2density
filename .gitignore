@@ -3,6 +3,7 @@ deps/
 temp/
 config_test/
 notebooks/
+p2d_sbatch.sh
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

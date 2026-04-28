@@ -55,6 +55,9 @@ def cli():
     parser.add_argument('--charm_done', action='store_true', default=False,
                         help="use this if charm is already done with the configuration you want to use. if using --charm_done, output_folder/subject_id/m2m_subject_id should already exist.")
 
+    parser.add_argument('--fill_holes', action='store_true', default=False,
+                        help="fill extra-cerebral soft-tissue voxels that are inside bone.")
+
     parser.add_argument('--ct_to_density_calibration',
             default="ct_to_density_calibration_cph2025_line_v1.csv",
             choices=[
@@ -126,7 +129,7 @@ def main(args, charm_args):
             petra_path = add_small_value_to_image(petra_path, subject_folder)
         run_segmentation(args.subject_id, t1_path, petra_path, m2m_folder, register_to_petra=args.register_to_petra, use_settings=charm_settings, charm_args=charm_args)
 
-    convert_petra_to_density(m2m_folder, norm_petra_to_pct_parameters, ct_to_density_calibration)
+    convert_petra_to_density(m2m_folder, norm_petra_to_pct_parameters, ct_to_density_calibration, args.fill_holes)
 
 
 def read_norm_petra_to_pct_parameter_file(path):
@@ -272,9 +275,39 @@ def normalize_petra(petra_data, label, plot=False):
         plt.show()
     norm_petra = petra_data / soft_tissue_value
     return norm_petra
+    
+    
+def fill_soft_tissue_holes_in_skull(label_image, m2m_folder):
+    import scipy.ndimage
+    label = label_image.get_fdata().squeeze()
+    struct = np.ones([3, 3, 3]) # fully connected
+    extr = label == 5 # extra cerebral soft tissue
+    labeled_array, num_features = scipy.ndimage.label(extr, structure=struct)
+
+    def infill(img, where, val):
+        for x,y,z in zip(*where): 
+            img[x, y, z] = val
+
+    label_copy = label.copy()
+    for i in range(num_features):
+        where = np.where(labeled_array == i)
+        if len(where[0]) > 20: # arbitrary size of chunk
+            continue
+
+        for x,y,z in zip(*where):
+    	    ngbh = label[x-1:x+2, y-1:y+2, z-1:z+2] # any bone in neighborhood
+    	    bony = (ngbh == 7).any() or (ngbh == 8).any()
+    	    if bony:
+                infill(label_copy, where, 7)
+                break
+
+    label_copy = label_copy[..., None]
+    fixed_label_image = nib.Nifti1Pair(label_copy, label_image.affine, label_image.header)
+    nib.save(fixed_label_image, m2m_folder / "final_tissue_with_hole_filling.nii.gz")
+    return label_copy
 
 
-def convert_petra_to_density(m2m_folder, norm_petra_to_pct_parameters, ct_to_density_calibration):
+def convert_petra_to_density(m2m_folder, norm_petra_to_pct_parameters, ct_to_density_calibration, fill_holes):
     petra_image = nib.load(m2m_folder / "segmentation" / "T2_bias_corrected.nii.gz")
     petra = petra_image.get_fdata()
     
@@ -282,7 +315,10 @@ def convert_petra_to_density(m2m_folder, norm_petra_to_pct_parameters, ct_to_den
     nib.save(petra_image, m2m_folder / "p2d_petra_bfc.nii.gz")
     
     label_image = nib.load(m2m_folder / "final_tissues.nii.gz")
-    label = label_image.get_fdata().squeeze()
+    if fill_holes:
+        label = fill_soft_tissue_holes_in_skull(label_image, m2m_folder).squeeze()
+    else:
+        label = label_image.get_fdata().squeeze()
 
     # create and save normalized petra
     norm_petra = normalize_petra(petra, label)
