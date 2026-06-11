@@ -1,7 +1,7 @@
 # petra2density
 
 
-Convert T1w and PETRA MRI head images to density maps. Work in progress. Work in progress.
+`petra2density` converts a T1-weighted MRI and a PETRA MRI of the head into a density image and pCT. Work in progress.
 
 
 ![Example data](/docs/images/example.jpg)
