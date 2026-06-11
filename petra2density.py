@@ -3,7 +3,9 @@ import csv
 from pathlib import Path
 import argparse
 import os.path
+import os
 import sys
+import subprocess
 
 # external
 from numpy import histogram, argmax, ones, logical_not, polyval
@@ -58,6 +60,9 @@ def cli():
     parser.add_argument('--fill_holes', action='store_true', default=False,
                         help="fill extra-cerebral soft-tissue voxels that are inside bone.")
 
+    parser.add_argument('--run-freesurfer-recon-all', action='store_true', default=False, help="WIP Probably won't work. Run and use the freesurfer recon-all brain segmentation.")
+    parser.add_argument('--t2', default=None, help="WIP Probably won't work. Use this t2 for the freesurfer recon-all segmentation. not used unless --run-freesurfer-recon-all is also used") 
+
     parser.add_argument('--ct_to_density_calibration',
             default="ct_to_density_calibration_cph2025_line_v1.csv",
             choices=[
@@ -79,8 +84,8 @@ def cli():
 
     args, remaining_args = parser.parse_known_args()
     remaining_args.extend([args.subject_id, args.t1_path]) # the t1_path here is not used. it's just here so i can reuse the parseArgument function from charm. the t1_path may be over-written elsewhere in this program
-    charm_args = simnibs.cli.charm.parseArguments(remaining_args)
-    main(args, charm_args)
+    
+    main(args, remaining_args)
 
 
 def simnibs_version_4_6_or_later():
@@ -92,7 +97,7 @@ def charm_settings_file_name():
     return "charm_simnibs_v4-6.ini" if simnibs_version_4_6_or_later() else "charm_simnibs_v4-5.ini"
 
 
-def main(args, charm_args):
+def main(args, remaining_args):
     t1_path = Path(args.t1_path).resolve()
     petra_path = Path(args.petra_path).resolve()
     subject_folder = Path(args.output_folder).resolve() / args.subject_id
@@ -100,6 +105,11 @@ def main(args, charm_args):
     ct_to_density_calibration_path = Path(__file__).parent.resolve() / "maps" / args.ct_to_density_calibration
     norm_petra_to_pct_parameters_path = Path(__file__).parent.resolve() / "maps" / args.norm_petra_to_pct_parameters
     charm_settings = Path(__file__).parent.resolve() / "config" / args.config_name / charm_settings_file_name()
+    
+    fs_dir = subject_folder / "fs" / args.subject_id
+    if args.run_freesurfer_recon_all:
+        remaining_args.extend(["--fs-dir", str(fs_dir)])
+    charm_args = simnibs.cli.charm.parseArguments(remaining_args)
 
     # read the calibration files. fails here if they are not found
     norm_petra_to_pct_parameters = read_norm_petra_to_pct_parameter_file(norm_petra_to_pct_parameters_path)
@@ -121,7 +131,14 @@ def main(args, charm_args):
             t1_path = align_image_to_kplan_space(t1_path, subject_folder)
         
     if args.register_to_petra and not args.charm_done:
-        t1_path = register_t1_to_petra(args.subject_id, t1_path, petra_path, subject_folder)
+        t1_path = register_image(args.subject_id, t1_path, petra_path, subject_folder, "t1")
+
+    if args.run_freesurfer_recon_all:
+        os.mkdir(str(fs_dir.parent))
+        if args.t2:
+            t2_path = Path(args.t2).resolve()
+            t2_path = register_image(args.subject_id, t2_path, t1_path, subject_folder, "t2")
+        run_freesurfer_recon_all(args.subject_id, t1_path, t2_path, fs_dir)        
 
     if not args.charm_done:
         if not simnibs_version_4_6_or_later():
@@ -171,22 +188,22 @@ def read_ct_to_density_calibration_file(path):
     return points
 
 
-def register_t1_to_petra(subject_id, t1_path, petra_path, output_folder : Path):
+def register_image(subject_id, image_path, target_path, output_folder : Path, output_name_prefix):
     """
-    Rigid registration of t1 to petra using charm
-    output file is saved as output_folder / t1_reg2petra.nii.gz
+    Rigid registration of image using charm
+    output file is saved as output_folder / output_name_prefix_coreg.nii.gz
     """
     RAS2LPS = np.diag([-1, -1, 1, 1])
     reg = gems.KvlRigidRegistration()
-    reg.read_images(str(petra_path), str(t1_path))
+    reg.read_images(str(target_path), str(image_path))
     reg.initialize_transform()
     reg.register()
     trans_mat = RAS2LPS@reg.get_transformation_matrix()@RAS2LPS
-    t1_output_path = output_folder / "t1_reg2petra.nii.gz"
-    reg.write_out_result(str(t1_output_path))
-    mat_path = output_folder / 't1_reg2petra_dof6.dat'
+    image_output_path = output_folder / f"{output_name_prefix}_coreg.nii.gz"
+    reg.write_out_result(str(image_output_path))
+    mat_path = output_folder / f'{output_name_prefix}_coreg_dof6.dat'
     np.savetxt(str(mat_path), trans_mat)
-    return t1_output_path
+    return image_output_path
 
 
 def add_small_value_to_image(image_path, output_folder, small_value=0.01):
@@ -207,6 +224,19 @@ def add_small_value_to_image(image_path, output_folder, small_value=0.01):
         nib.save(new_image, output_path)
         return output_path
     return image_path
+    
+    
+def run_freesurfer_recon_all(subject_id, t1_path, t2_path, fs_dir):
+    raise Exception("WIP")
+    env = os.environ.copy()
+    env["SUBJECTS_DIR"] = str(fs_dir.parent)
+    cmd = ["recon-all", "-s", subject_id, "-i", str(t1_path)]
+    if t2_path:
+        cmd.extend(["-T2", str(t2_path)])
+    cmd.extend(["-threads", "8"])
+    cmd.extend(["-hires"])
+    cmd.extend(["-T2pial", "-all"])
+    subprocess.run(cmd, env=env)
 
 
 def run_segmentation(subject_id, t1_path, petra_path, m2m_folder, register_to_petra, use_settings, charm_args):
@@ -289,7 +319,7 @@ def fill_soft_tissue_holes_in_skull(label_image, m2m_folder):
             img[x, y, z] = val
 
     label_copy = label.copy()
-    for i in range(num_features):
+    for i in range(num_features + 1):
         where = np.where(labeled_array == i)
         if len(where[0]) > 20: # arbitrary size of chunk
             continue
